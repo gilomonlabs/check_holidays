@@ -1,0 +1,37 @@
+name: validate
+
+# 앱은 형식이 깨진 holidays.json 을 조용히 무시한다 — 그러면 아무도 모르는 채로
+# 업데이트가 멈춘다. 그 침묵을 push 시점에 깬다.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # 이전 커밋의 version 과 비교하기 위해
+
+      - name: 이전 version 읽기
+        id: prev
+        run: |
+          # holidays.json 이 이번 푸시에서 실제로 바뀐 경우에만 version 비교를 건다.
+          # README 만 고친 푸시까지 "version 안 올렸다"고 막으면 그건 오탐이다.
+          if git show HEAD~1:holidays.json > /tmp/prev.json 2>/dev/null && ! cmp -s /tmp/prev.json holidays.json; then
+            prev=$(python3 -c "import json;print(json.load(open('/tmp/prev.json')).get('version',''))" 2>/dev/null || echo "")
+            echo "value=${prev}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: holidays.json 검사
+        run: |
+          if [ -n "${{ steps.prev.outputs.value }}" ]; then
+            python3 validate.py holidays.json --prev "${{ steps.prev.outputs.value }}"
+          else
+            python3 validate.py holidays.json
+          fi
