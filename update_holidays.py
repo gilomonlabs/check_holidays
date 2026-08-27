@@ -91,7 +91,10 @@ def main() -> int:
         print("출처에서 공휴일을 하나도 못 찾았습니다 — 형식이 바뀌었을 수 있어 중단합니다")
         return 1
 
-    new = sorted(set(found) - current)
+    # 사람이 "이건 공휴일 아니다"라고 뺀 날짜를 출처가 다시 밀어넣지 못하게 한다.
+    # (출처가 제헌절·노동절처럼 관공서 공휴일이 아닌 걸 넣는 일이 실제로 있다.)
+    retracted = set(doc.get("removed", []))
+    new = sorted(set(found) - current - retracted)
     if not new:
         print(f"변경 없음 (현재 {len(current)}일, 출처 {len(found)}일)")
         return 0

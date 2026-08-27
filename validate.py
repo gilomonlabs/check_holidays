@@ -73,6 +73,28 @@ def main() -> int:
     if sorted(seen) != [d for d in dates if isinstance(d, str) and d in seen][: len(seen)]:
         warnings.append("날짜가 정렬돼 있지 않습니다 (동작엔 무관, 읽기 편하도록 권장)")
 
+    removed = doc.get("removed", [])
+    if not isinstance(removed, list):
+        errors.append(f"removed 가 배열이 아닙니다: {type(removed).__name__}")
+        removed = []
+    rset = set()
+    for d in removed:
+        if not isinstance(d, str) or not ISO.match(d):
+            errors.append(f"removed 의 날짜 형식이 잘못됐습니다: {d!r}")
+            continue
+        y, m, dd = (int(x) for x in d.split("-"))
+        try:
+            date(y, m, dd)
+        except ValueError:
+            errors.append(f"removed 에 달력에 없는 날짜: {d}")
+            continue
+        rset.add(d)
+    both = rset & seen
+    if both:
+        errors.append(
+            f"dates 와 removed 에 같이 있습니다(뜻이 모순): {sorted(both)}"
+        )
+
     if prev is not None and isinstance(version, int):
         if version == prev:
             errors.append(
@@ -93,6 +115,7 @@ def main() -> int:
         print(f"\nFAIL — 오류 {len(errors)}건")
         return 1
     print(f"OK — version {version} / 날짜 {len(seen)}개"
+          + (f" / 취소 {len(rset)}개" if rset else "")
           + (f" ({min(seen)} ~ {max(seen)})" if seen else ""))
     return 0
 
