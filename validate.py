@@ -4,7 +4,11 @@
 앱은 형식이 깨진 파일을 **조용히 무시**한다(오류 화면이 없다). 그래서 잘못 올리면
 아무도 모르는 채로 업데이트가 멈춘다. 그 침묵을 여기서 깬다.
 
-    python validate.py [holidays.json] [--prev 이전_version]
+    python validate.py [holidays.json] [--prev-file 이전.json]
+
+--prev-file 을 주면 **앱이 실제로 읽는 내용**(dates·removed)이 바뀌었는지 보고,
+바뀌었는데 version 을 안 올렸으면 막는다. note 나 updated 만 고친 변경까지
+version 을 요구하면 사용자에게 무의미한 업데이트가 나간다.
 """
 import json
 import re
@@ -20,10 +24,13 @@ FIXED = {(1, 1), (3, 1), (5, 5), (6, 6), (8, 15), (10, 3), (10, 9), (12, 25)}
 def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     path = args[0] if args else "holidays.json"
-    prev = None
-    if "--prev" in sys.argv:
-        raw = sys.argv[sys.argv.index("--prev") + 1]
-        prev = int(raw) if raw.strip().isdigit() else None
+    prev_doc = None
+    if "--prev-file" in sys.argv:
+        try:
+            with open(sys.argv[sys.argv.index("--prev-file") + 1], encoding="utf-8") as f:
+                prev_doc = json.load(f)
+        except Exception:
+            prev_doc = None  # 이전 파일이 없거나 깨졌으면 비교를 건너뛴다
 
     errors, warnings = [], []
 
@@ -95,15 +102,28 @@ def main() -> int:
             f"dates 와 removed 에 같이 있습니다(뜻이 모순): {sorted(both)}"
         )
 
-    if prev is not None and isinstance(version, int):
-        if version == prev:
-            errors.append(
-                f"version 이 그대로입니다({version}). 내용을 바꿨다면 +1 하세요 — "
-                "안 올리면 사용자 앱은 영원히 못 받습니다"
+    if prev_doc is not None and isinstance(version, int):
+        prev_v = prev_doc.get("version")
+        # 앱이 실제로 읽는 것만 비교한다(note·updated 변경은 version 을 요구하지 않는다).
+        def sig(d):
+            return (
+                sorted(x for x in d.get("dates", []) if isinstance(x, str)),
+                sorted(x for x in d.get("removed", []) if isinstance(x, str)),
             )
-        elif version < prev:
-            errors.append(
-                f"version 이 내려갔습니다({prev} → {version}). 앱 비교가 '>' 라 무시됩니다"
+        if sig(prev_doc) != sig(doc):
+            if version == prev_v:
+                errors.append(
+                    f"dates/removed 를 바꿨는데 version 이 그대로입니다({version}). +1 하세요 — "
+                    "안 올리면 사용자 앱은 영원히 못 받습니다"
+                )
+            elif isinstance(prev_v, int) and version < prev_v:
+                errors.append(
+                    f"version 이 내려갔습니다({prev_v} → {version}). 앱 비교가 '>' 라 무시됩니다"
+                )
+        elif version != prev_v:
+            warnings.append(
+                f"내용은 그대로인데 version 만 바뀌었습니다({prev_v} → {version}) — "
+                "사용자에게 빈 업데이트가 나갑니다"
             )
 
     for w in warnings:

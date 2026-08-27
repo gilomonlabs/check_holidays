@@ -33,8 +33,8 @@ jobs:
       - name: 형식 검사 (바뀐 경우만)
         if: steps.run.outputs.changed == 'true'
         run: |
-          prev=$(git show HEAD:holidays.json | python3 -c "import sys,json;print(json.load(sys.stdin)['version'])")
-          python3 validate.py holidays.json --prev "$prev"
+          git show HEAD:holidays.json > /tmp/prev.json
+          python3 validate.py holidays.json --prev-file /tmp/prev.json
 
       - name: 커밋
         if: steps.run.outputs.changed == 'true'
