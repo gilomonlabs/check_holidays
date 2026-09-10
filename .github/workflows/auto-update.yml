@@ -4,8 +4,9 @@ name: auto-update
 #
 # 임시공휴일·선거일은 보통 2주 전에는 발표되므로 하루 1회면 넉넉하다.
 # 출처(구글 캘린더 '대한민국의 휴일' ICS)는 API 키가 필요 없다.
-# **추가만 하고 삭제하지 않는다** — 출처가 미래 연도의 대체공휴일·선거일을
-# 빠뜨리는 것이 확인돼, 없다는 이유로 지우면 멀쩡한 휴일이 사라진다.
+# 추가는 자동. 삭제는 "출처가 알던 날을 7일 이상 거둬들였을 때"만 자동(update_holidays.py 참조) —
+# 출처가 미래 연도의 대체공휴일·선거일을 아예 모르는 경우가 있어, 단순히 "출처에 없으면 삭제"로
+# 가면 멀쩡한 휴일이 사라진다. 사람이 봐야 할 일이 생기면 이슈를 연다.
 on:
   schedule:
     - cron: "17 21 * * *"   # 매일 UTC 21:17 = KST 06:17
@@ -13,6 +14,7 @@ on:
 
 permissions:
   contents: write            # 자동 커밋용
+  issues: write              # 사람 확인이 필요할 때 이슈 생성
 
 jobs:
   update:
@@ -24,14 +26,20 @@ jobs:
         id: run
         run: |
           python3 update_holidays.py | tee /tmp/out.txt
+          # holidays.json(앱이 읽는 것)과 스냅샷·상태(사람이 보는 것)를 따로 판단한다.
           if git diff --quiet -- holidays.json; then
+            echo "data_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "data_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$(git status --porcelain -- holidays.json source_seen.json STATUS.md)" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 형식 검사 (바뀐 경우만)
-        if: steps.run.outputs.changed == 'true'
+      - name: 형식 검사 (holidays.json 이 바뀐 경우만)
+        if: steps.run.outputs.data_changed == 'true'
         run: |
           git show HEAD:holidays.json > /tmp/prev.json
           python3 validate.py holidays.json --prev-file /tmp/prev.json
@@ -39,23 +47,44 @@ jobs:
       - name: 커밋
         if: steps.run.outputs.changed == 'true'
         run: |
-          added=$(grep -c '^  + ' /tmp/out.txt) || added=0
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add holidays.json
-          git commit -F - <<MSG
-          chore: 공휴일 자동 갱신 — ${added}일 추가
+          git add holidays.json source_seen.json STATUS.md
+          if [ "${{ steps.run.outputs.data_changed }}" = "true" ]; then
+            added=$(grep -c '^  + ' /tmp/out.txt) || added=0
+            retracted=$(grep -c '^  - ' /tmp/out.txt) || retracted=0
+            restored=$(grep -c '^  ~ ' /tmp/out.txt) || restored=0
+            git commit -F - <<MSG
+          chore: 공휴일 자동 갱신 — 추가 ${added}·취소 ${retracted}·복구 ${restored}
 
-          $(grep '^  + ' /tmp/out.txt)
+          $(grep -E '^  [-+~!] ' /tmp/out.txt)
 
           출처: 구글 캘린더 '대한민국의 휴일' ICS (키 불필요).
-          추가만 하고 삭제하지 않는다 — 출처가 미래 대체공휴일·선거일을 빠뜨린다.
+          추가는 자동, 취소는 출처가 알던 날을 7일 이상 거둬들였을 때만(update_holidays.py).
           MSG
+          else
+            git commit -m "chore: 출처 스냅샷·STATUS 갱신 (공휴일 변경 없음)"
+          fi
           git push
+
+      # update_holidays.py 가 report.md 를 남기면 사람이 봐야 할 일이 있는 것이다
+      # (출처가 한꺼번에 여러 날을 거둬들였거나, 자동으로 취소·복구한 날이 있을 때).
+      # 같은 제목의 열린 이슈가 있으면 다시 만들지 않는다.
+      - name: 사람 확인 이슈
+        if: hashFiles('report.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="공휴일 확인 필요 — $(date -u +%F)"
+          if [ -n "$(gh issue list --state open --search "in:title \"공휴일 확인 필요\"" --json number --jq '.[0].number')" ]; then
+            echo "열린 이슈가 이미 있어 새로 만들지 않음"; exit 0
+          fi
+          gh issue create --title "$title" --body-file report.md
+
       # ★GitHub는 공개 저장소에 60일간 커밋이 없으면 schedule 워크플로를 자동 비활성화한다
-      #   (워크플로가 매일 돌아도 '활동'으로 안 친다). 공휴일은 몇 달씩 변화가 없을 수 있어
-      #   그대로 두면 어느 날 조용히 멈춘다. 마지막 커밋이 45일을 넘으면 표시 파일만 갱신해
-      #   커밋한다 — holidays.json 은 건드리지 않으므로 앱엔 아무 영향이 없다.
+      #   (워크플로가 매일 돌아도 '활동'으로 안 친다). 스냅샷이 7일마다 커밋되므로 평소엔
+      #   걸릴 일이 없지만, 출처 장애 등으로 커밋이 끊겨도 멈추지 않도록 45일이 넘으면
+      #   표시 파일만 갱신해 커밋한다 — holidays.json 은 건드리지 않으므로 앱엔 영향이 없다.
       - name: 60일 무활동 자동 비활성화 방지
         if: steps.run.outputs.changed == 'false'
         run: |

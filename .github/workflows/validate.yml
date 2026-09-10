@@ -21,6 +21,9 @@ jobs:
           # validate.py 가 dates/removed 만 비교하므로, note 만 고친 변경은 통과한다.
           git show HEAD~1:holidays.json > /tmp/prev.json 2>/dev/null || true
 
+      - name: 수집 규칙 단위 테스트
+        run: python3 -m unittest -v
+
       - name: holidays.json 검사
         run: |
           if [ -f /tmp/prev.json ]; then
