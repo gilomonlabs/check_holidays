@@ -135,6 +135,10 @@ https://raw.githubusercontent.com/gilomonlabs/check_holidays/main/holidays.json
 새 공휴일이 생기면 `dates` 에 넣고 `version` 을 +1 해서 스스로 커밋합니다.
 바뀐 게 없으면 아무것도 하지 않습니다. Public 저장소라 **Actions 는 무료**입니다.
 
+★GitHub 은 공개 저장소에 **60일간 커밋이 없으면 schedule 워크플로를 자동으로 꺼 버립니다**(매일 돌아도 활동으로 안 칩니다).
+공휴일은 몇 달씩 변화가 없을 수 있어 그대로 두면 어느 날 조용히 멈춥니다. 그래서 워크플로가 마지막 커밋 45일이 넘으면
+`.github/last-run` 만 갱신해 커밋합니다(`holidays.json` 은 안 건드림 → 앱엔 영향 0). 그래도 꺼졌다면 Actions 탭에서 **Enable workflow** 한 번.
+
 즉 임시공휴일이 발표되면 **손대지 않아도 며칠 안에 반영**됩니다.
 당장 돌리고 싶으면 Actions 탭 → `auto-update` → **Run workflow**.
 

@@ -52,3 +52,21 @@ jobs:
           추가만 하고 삭제하지 않는다 — 출처가 미래 대체공휴일·선거일을 빠뜨린다.
           MSG
           git push
+      # ★GitHub는 공개 저장소에 60일간 커밋이 없으면 schedule 워크플로를 자동 비활성화한다
+      #   (워크플로가 매일 돌아도 '활동'으로 안 친다). 공휴일은 몇 달씩 변화가 없을 수 있어
+      #   그대로 두면 어느 날 조용히 멈춘다. 마지막 커밋이 45일을 넘으면 표시 파일만 갱신해
+      #   커밋한다 — holidays.json 은 건드리지 않으므로 앱엔 아무 영향이 없다.
+      - name: 60일 무활동 자동 비활성화 방지
+        if: steps.run.outputs.changed == 'false'
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          days=$(( (now - last) / 86400 ))
+          echo "마지막 커밋으로부터 ${days}일"
+          if [ "$days" -lt 45 ]; then exit 0; fi
+          date -u +%F > .github/last-run
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/last-run
+          git commit -m "chore: 스케줄 유지용 커밋 (${days}일 무변경 — 공휴일 데이터 변경 없음)"
+          git push
