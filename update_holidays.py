@@ -372,7 +372,7 @@ def render_report(plan: dict, seen: dict, gov_errors=()) -> str:
     if plan["retract"]:
         parts.append("## 출처가 거둬들여 자동으로 removed 에 넣었습니다\n")
         parts += [f"- {d} ({seen.get(d, {}).get('name', '')})" for d in plan["retract"]]
-        parts.append("\n앱은 다음 확인 때(최대 7일) 이 날을 평일로 되돌립니다. 잘못이면 removed 에서 빼고 version 을 +1 하세요.")
+        parts.append("\n앱은 다음 확인 때(최대 3일) 이 날을 평일로 되돌립니다. 잘못이면 removed 에서 빼고 version 을 +1 하세요.")
         parts.append("")
     if plan["restore"]:
         parts.append("## 출처에 다시 나타나 되살렸습니다\n")
