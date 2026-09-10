@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-"""공휴일 자동 수집 — 구글 캘린더 '대한민국의 휴일' ICS에서 받아 holidays.json 에 병합.
+"""공휴일 자동 수집 — 정부 특일정보 API(정답) + 구글 캘린더 ICS(먼 미래 보충) → holidays.json.
 
     python update_holidays.py [--dry-run]
 
-**추가는 자동, 삭제는 "출처가 알던 날을 거둬들였을 때만" 자동.**
+## 두 출처의 역할
 
-출처가 미래 연도의 대체공휴일·선거일을 빠뜨리는 것이 실측으로 확인됐다
-(예: 2030-05-06 대체공휴일(월), 2028-04-12 총선이 없다). 그래서 "출처에 없다"는
-이유만으로 기존 날짜를 지우면 멀쩡한 휴일이 사라진다. 대신 이렇게 가른다:
+1. **정부(공공데이터포털 · 한국천문연구원 특일정보, 서비스 ID 15012690)** — 관공서 공휴일의
+   원본. 임시공휴일·대체공휴일이 지정되면 여기에 실린다. 올해·내년 정도만 제공한다.
+   키가 필요하다(무료, 자동 승인) → 환경변수 `DATA_GO_KR_KEY`(GitHub Actions 는 secret).
+   정부가 **한 해를 온전히**(GOV_MIN_PER_YEAR 개 이상) 돌려주면 그 해는 정부가 정답이다:
+     · 정부에 있는 날은 바로 더한다(기다리지 않는다).
+     · 정부에 없는 날(오늘 이후)은 GOV_RETRACT_AFTER_DAYS 일 연속 없으면 `removed` 로 취소한다.
+       (하루짜리 API 장애·부분 응답에 휘둘리지 않으려는 최소한의 유예.)
+     · 그 해엔 구글이 더하는 것을 받지 않는다(정부가 모르는 날을 구글 때문에 넣었다 빼는 왕복 방지).
+2. **구글 캘린더 '대한민국의 휴일' ICS** — 키 불필요, 2031년까지. 정부가 아직 모르는
+   해에만 쓴다. 구글은 미래 연도의 대체공휴일·선거일을 빠뜨리므로 "구글에 없다"는 이유로는
+   지우지 않고, 구글이 **알다가 거둬들인** 날만 RETRACT_AFTER_DAYS 일 뒤에 취소한다.
 
-  · 출처가 **한 번도 몰랐던** 날짜(사람이 넣은 미래 대체공휴일·선거일) → 절대 안 지운다.
-  · 출처가 **알고 있다가 거둬들인** 날짜(법 개정으로 공휴일에서 빠짐, 대체공휴일 날짜 이동)
-    → 7일 이상 계속 안 보이면 `removed` 로 옮긴다(앱 내장까지 취소되도록).
-  · 한 번에 4개 이상 거둬들여지면 출처 장애·형식 변경일 수 있으니 손대지 않고
-    이슈로 사람에게 넘긴다.
+키가 없으면 2번만 동작한다(예전 방식). 어느 쪽이든 한 번에 MAX_AUTO_RETRACT 개보다 많이
+취소하게 되면 출처 장애·형식 변경일 수 있으니 손대지 않고 이슈(report.md)로 사람에게 넘긴다.
 
-그러려면 "출처가 언제 무엇을 알았는지"를 기억해야 해서 source_seen.json 에 남긴다.
-비교 결과는 STATUS.md 에 표로 적어 사람이 아무 때나 볼 수 있게 한다.
-
-API 키가 필요 없다(공공데이터포털 특일정보는 키가 필요해 안 쓴다).
+출처가 언제 무엇을 알았는지는 source_seen.json 에 남기고, 비교 결과는 STATUS.md 에 적는다.
 """
 import io
 import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date
 
@@ -32,18 +36,20 @@ ICS_URL = (
     "https://calendar.google.com/calendar/ical/"
     "ko.south_korea%23holiday%40group.v.calendar.google.com/public/basic.ics"
 )
+GOV_URL = "https://apis.data.go.kr/B090041/openapi/service/SpcdeInfoService/getRestDeInfo"
+GOV_KEY_ENV = "DATA_GO_KR_KEY"
 
 # 앱이 코드로 매년 계산하는 고정 양력 공휴일 — dates 에 넣으면 중복이다.
 # (출처가 이 날을 거둬들이면 removed 로는 취소한다 — 앱 내장을 끄는 유일한 길이므로.)
 FIXED = {(1, 1), (3, 1), (5, 5), (6, 6), (8, 15), (10, 3), (10, 9), (12, 25)}
 
+# 앱이 2026년부터 코드로 계산하는 날(2026년 법 개정으로 공휴일이 된 노동절·제헌절).
+# dates 에도 두지만(구 빌드용), 출처가 거둬들이면 removed 로 취소해야 내장 계산까지 꺼진다.
+APP_COMPUTED_SINCE = {(5, 1): 2026, (7, 17): 2026}
+
 # 관공서 공휴일이 아닌데 출처가 '공휴일'로 표시하는 것을 이름으로 거른다. 지금은 없다.
-#  · 노동절은 2026-09-10까지 여기 있었다 — 근로기준법상 유급휴일일 뿐 관공서 공휴일이
-#    아니었기 때문. 그런데 2026년 '공휴일에 관한 법률' 개정(3월 31일 국회 통과)으로
-#    2026년 5월 1일부터 관공서 공휴일이 됐고 대체공휴일도 적용된다(2027-05-03).
-#    제헌절도 같은 해 1월 개정으로 18년 만에 복귀했다(출처가 2026년부터 '공휴일'로 표시).
-#  · 법이 또 바뀌어 빼야 하면 여기 이름을 넣고, 이미 들어간 날짜는 holidays.json 의
-#    removed 로 취소한다.
+#  · 노동절은 2026-09-10까지 여기 있었다 — 2026년 법 개정으로 관공서 공휴일이 돼 뺐다.
+#  · 법이 또 바뀌면 정부 출처가 먼저 반영하므로 보통은 손댈 일이 없다.
 EXCLUDE_KEYWORDS: set[str] = set()
 
 # 이 범위 밖은 무시(출처에 과거 몇 년치가 같이 들어 있다).
@@ -53,10 +59,84 @@ SEEN_PATH = "source_seen.json"
 STATUS_PATH = "STATUS.md"
 REPORT_PATH = "report.md"          # 있으면 워크플로가 이슈를 만든다
 
-RETRACT_AFTER_DAYS = 7             # 이 기간 이상 계속 안 보여야 거둬들인 것으로 본다
+RETRACT_AFTER_DAYS = 7             # 구글: 알던 날이 이 기간 이상 안 보여야 거둬들인 것으로 본다
+GOV_RETRACT_AFTER_DAYS = 3         # 정부: 온전한 연도 응답에 이 기간 연속 없으면 취소
+GOV_MIN_PER_YEAR = 12              # 정부 응답이 이보다 적으면 그 해는 "아직 모름"으로 본다
 MAX_AUTO_RETRACT = 3               # 한 번에 이보다 많이 사라지면 사람에게 넘긴다
 SNAPSHOT_REFRESH_DAYS = 7          # 변화가 없어도 이 주기로 스냅샷·STATUS 를 갱신
 
+
+# ── 출처 1: 정부 특일정보 ──────────────────────────────────────────────────
+
+def fetch_gov(key: str, year: int) -> str:
+    # ★키는 urlencode 로 한 번만 인코딩한다. 포털의 '인코딩 키'를 다시 인코딩하면
+    #   SERVICE_KEY_IS_NOT_REGISTERED_ERROR 가 난다 — '디코딩 키'를 secret 에 넣을 것.
+    q = f"serviceKey={urllib.parse.quote(key, safe='')}&solYear={year}&numOfRows=100&_type=json"
+    req = urllib.request.Request(f"{GOV_URL}?{q}", headers={"User-Agent": "check_holidays/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # 키 오류는 403 + 본문(JSON)으로 온다 — 본문을 돌려줘 parse_gov 가 이유를 읽게 한다.
+        body = e.read().decode("utf-8", "replace")
+        if body.strip():
+            return body
+        raise
+
+
+def parse_gov(raw: str) -> dict:
+    """정부 응답 → (YYYY-MM-DD → 이름), isHoliday == 'Y' 만. 오류 응답이면 ValueError."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        m = re.search(r"<returnAuthMsg>(.*?)</returnAuthMsg>|<errMsg>(.*?)</errMsg>", raw)
+        raise ValueError(f"JSON 아님: {(m.group(1) or m.group(2)) if m else raw[:80]!r}")
+    if "OpenAPI_ServiceResponse" in obj:  # 키 오류 등은 이 모양으로 온다
+        h = obj["OpenAPI_ServiceResponse"].get("cmmMsgHeader", {})
+        raise ValueError(f"{h.get('errMsg')} / {h.get('returnAuthMsg')}")
+    resp = obj.get("response", {})
+    code = str(resp.get("header", {}).get("resultCode", ""))
+    if code not in ("00", "0"):
+        raise ValueError(f"resultCode={code} {resp.get('header', {}).get('resultMsg')}")
+    items = resp.get("body", {}).get("items") or {}
+    item = items.get("item", []) if isinstance(items, dict) else []
+    if isinstance(item, dict):   # 항목이 하나면 리스트가 아니라 객체로 온다
+        item = [item]
+    out = {}
+    for it in item:
+        if str(it.get("isHoliday", "")).upper() != "Y":
+            continue
+        ds = str(it.get("locdate", ""))
+        if not re.fullmatch(r"\d{8}", ds):
+            continue
+        y, mo, dd = int(ds[:4]), int(ds[4:6]), int(ds[6:])
+        try:
+            date(y, mo, dd)
+        except ValueError:
+            continue
+        out[f"{y:04d}-{mo:02d}-{dd:02d}"] = str(it.get("dateName", "")).strip()
+    return out
+
+
+def gov_holidays(key: str, years, fetch=fetch_gov):
+    """연도별로 정부에 묻는다. 반환 (found, covered_years, errors).
+    covered_years 는 GOV_MIN_PER_YEAR 개 이상 돌려준 해만 — 그 해에 한해 정부가 정답이다."""
+    found, covered, errors = {}, set(), []
+    for y in years:
+        try:
+            got = parse_gov(fetch(key, y))
+        except Exception as e:  # 네트워크·키·형식 — 그 해는 모르는 것으로
+            errors.append(f"{y}: {e}")
+            continue
+        if len(got) >= GOV_MIN_PER_YEAR:
+            covered.add(y)
+            found.update(got)
+        else:
+            errors.append(f"{y}: {len(got)}개뿐이라 아직 없는 해로 봄")
+    return found, covered, errors
+
+
+# ── 출처 2: 구글 캘린더 ────────────────────────────────────────────────────
 
 def fetch_ics(url: str = ICS_URL) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "check_holidays/1.0"})
@@ -93,10 +173,7 @@ def parse_ics(raw: str):
     return out
 
 
-# 앱이 2026년부터 코드로 계산하는 날(2026년 법 개정). dates 에도 두지만(구 빌드용),
-# 출처가 거둬들이면 removed 로 취소해야 새 빌드의 내장 계산까지 꺼진다.
-APP_COMPUTED_SINCE = {(5, 1): 2026, (7, 17): 2026}
-
+# ── 공통 ─────────────────────────────────────────────────────────────────
 
 def is_fixed(d: str) -> bool:
     y, m, dd = (int(x) for x in d.split("-"))
@@ -110,65 +187,107 @@ def is_app_computed(d: str) -> bool:
     return (m, dd) in FIXED or (since is not None and y >= since)
 
 
-def update_seen(seen: dict, found: dict, today: str) -> dict:
-    """출처가 오늘 보여준 날짜의 first/last 를 갱신. 반환은 새 dict(입력 불변)."""
-    out = {k: dict(v) for k, v in seen.items()}
-    for d, name in found.items():
-        cur = out.get(d)
-        if cur is None:
-            out[d] = {"name": name, "first": today, "last": today}
-        else:
-            cur["name"] = name
-            cur["last"] = today
-    return out
+def app_computed_dates(year: int):
+    out = [f"{year:04d}-{m:02d}-{d:02d}" for (m, d) in FIXED]
+    out += [f"{year:04d}-{m:02d}-{d:02d}" for (m, d), since in APP_COMPUTED_SINCE.items() if year >= since]
+    return sorted(out)
 
 
 def _days_between(a: str, b: str) -> int:
     return (date.fromisoformat(b) - date.fromisoformat(a)).days
 
 
-def plan_changes(dates: set, removed: set, found: dict, seen: dict, today: str):
-    """무엇을 더하고 무엇을 거둬들일지 정한다. 파일은 건드리지 않는다.
+def update_seen(seen: dict, found: dict, today: str, source: str = "google") -> dict:
+    """출처가 오늘 보여준 날짜의 first/last 를 갱신. 반환은 새 dict(입력 불변).
+    구글은 first/last, 정부는 gov_first/gov_last 에 적는다."""
+    f, l = ("first", "last") if source == "google" else ("gov_first", "gov_last")
+    out = {k: dict(v) for k, v in seen.items()}
+    for d, name in found.items():
+        cur = out.setdefault(d, {})
+        cur["name"] = name or cur.get("name", "")
+        cur.setdefault(f, today)
+        cur[l] = today
+    return out
+
+
+def plan_changes(dates: set, removed: set, found: dict, seen: dict, today: str,
+                 gov: dict | None = None, gov_years: set | None = None):
+    """무엇을 더하고 무엇을 거둬들일지 정한다. 파일은 건드리지 않는다(seen 의 gov_absent_since 만 갱신).
 
     반환 dict:
-      add      : dates 에 더할 날짜(정렬)
-      retract  : removed 로 옮길 날짜(정렬) — 출처가 알다가 RETRACT_AFTER_DAYS 이상 거둬들인 것
-      restore  : removed 에서 되살릴 날짜(정렬) — 자동으로 거둬들였던 것이 출처에 다시 나타남
-      anomaly  : 거둬들일 후보가 MAX_AUTO_RETRACT 를 넘어 손대지 않았으면 그 목록(사람 확인)
-      only_local: dates 에 있는데 출처가 한 번도 몰랐던 날짜(정보용, 안 지움)
+      add       : dates 에 더할 날짜 — 정부가 아는 해는 정부에서, 나머지 해는 구글에서
+      retract   : removed 로 옮길 날짜 — 정부가 아는 해: 정부 응답에 GOV_RETRACT_AFTER_DAYS 일 연속 없음 /
+                  나머지 해: 구글이 알다가 RETRACT_AFTER_DAYS 일 이상 거둬들임
+      restore   : removed 에서 되살릴 날짜 — 자동으로 거둬들였던 것이 출처에 다시 나타남
+      anomaly   : 취소 후보가 MAX_AUTO_RETRACT 를 넘어 손대지 않았으면 그 목록(사람 확인)
+      only_local: dates 에 있는데 어느 출처도 모르는 미래 날짜(정보용) — 정부가 아는 해에서는 곧 취소 대상
     `seen` 은 update_seen 을 거친 **오늘 기준** 지도여야 한다.
     """
+    gov = gov or {}
+    gov_years = gov_years or set()
     auto_retracted = {d for d, v in seen.items() if v.get("retracted")}
 
-    add = sorted(
-        d for d in found
-        if not is_fixed(d) and d not in dates and d not in removed
-    )
+    def year(d: str) -> int:
+        return int(d[:4])
 
-    # 자동으로 거둬들였던 날짜가 출처에 다시 나타났다 → 되살린다(사람이 뺀 것은 그대로).
-    restore = sorted(d for d in removed if d in found and d in auto_retracted)
+    # 더하기 — 정부가 아는 해는 정부만, 나머지는 구글.
+    add = set()
+    for d in gov:
+        if year(d) in gov_years and not is_fixed(d) and d not in dates and d not in removed:
+            add.add(d)
+    for d in found:
+        if year(d) not in gov_years and not is_fixed(d) and d not in dates and d not in removed:
+            add.add(d)
 
-    max_year = max((int(d[:4]) for d in found), default=0)
-    candidates = []
-    for d, info in seen.items():
-        if d in found or d in removed or d < today:
+    # 되살리기 — 자동으로 거둬들였던 날짜가 그 해의 정답 출처에 다시 나타남(사람이 뺀 것은 그대로).
+    restore = set()
+    for d in removed:
+        if d not in auto_retracted:
             continue
-        if int(d[:4]) > max_year:          # 출처 범위 밖(출처가 그 해를 아직 모름)
+        src = gov if year(d) in gov_years else found
+        if d in src:
+            restore.add(d)
+
+    candidates = set()
+
+    # 취소 ① 정부가 아는 해: 앱이 빨갛게 칠할 날(dates ∪ 앱 계산)이 정부 응답에 없다.
+    for y in sorted(gov_years):
+        interest = {d for d in dates if year(d) == y} | set(app_computed_dates(y))
+        for d in sorted(interest):
+            if d < today or d in removed:
+                continue
+            info = seen.setdefault(d, {})
+            if d in gov:
+                info.pop("gov_absent_since", None)
+                continue
+            info.setdefault("gov_absent_since", today)
+            if _days_between(info["gov_absent_since"], today) >= GOV_RETRACT_AFTER_DAYS:
+                candidates.add(d)
+
+    # 취소 ② 정부가 모르는 해: 구글이 알다가 거둬들였다(한 번도 몰랐던 날은 절대 안 지운다).
+    max_year = max((year(d) for d in found), default=0)
+    for d, info in seen.items():
+        if year(d) in gov_years or not info.get("last"):
+            continue
+        if d in found or d in removed or d < today or year(d) > max_year:
             continue
         if _days_between(info["last"], today) < RETRACT_AFTER_DAYS:
             continue
-        if d in dates or is_app_computed(d):  # 앱 달력에 빨갛게 나올 날만 의미가 있다
-            candidates.append(d)
-    candidates.sort()
+        if d in dates or is_app_computed(d):
+            candidates.add(d)
 
+    candidates = sorted(candidates)
     if len(candidates) > MAX_AUTO_RETRACT:
         retract, anomaly = [], candidates
     else:
         retract, anomaly = candidates, []
 
-    only_local = sorted(d for d in dates if d not in seen and d >= today)
+    only_local = sorted(
+        d for d in dates
+        if d >= today and d not in found and d not in gov
+    )
     return {
-        "add": add, "retract": retract, "restore": restore,
+        "add": sorted(add), "retract": retract, "restore": sorted(restore),
         "anomaly": anomaly, "only_local": only_local,
     }
 
@@ -192,7 +311,7 @@ def apply_plan(doc: dict, plan: dict, seen: dict, today: str) -> bool:
             removed.discard(d)
             if not is_fixed(d):
                 dates.add(d)
-            seen[d].pop("retracted", None)
+            seen.setdefault(d, {}).pop("retracted", None)
         changed = True
     if changed:
         doc["dates"] = sorted(dates)
@@ -202,21 +321,31 @@ def apply_plan(doc: dict, plan: dict, seen: dict, today: str) -> bool:
     return changed
 
 
-def render_status(doc: dict, found: dict, seen: dict, plan: dict, today: str) -> str:
+def render_status(doc: dict, found: dict, seen: dict, plan: dict, today: str,
+                  gov_years=(), gov_errors=(), gov_enabled=False) -> str:
     years = sorted({int(d[:4]) for d in found})
+    gy = sorted(gov_years)
     lines = [
         "# 상태 (자동 생성 — 손으로 고치지 마세요)",
         "",
         f"- 마지막 확인: {today}",
         f"- holidays.json version: {doc.get('version')} / dates {len(doc.get('dates', []))}개 / removed {len(doc.get('removed', []))}개",
-        f"- 출처가 아는 공휴일: {len(found)}개 ({years[0] if years else '-'}~{years[-1] if years else '-'})",
-        "",
-        "## 출처와 다른 점",
+        (f"- 정부 특일정보(정답): {', '.join(str(y) for y in gy) if gy else '온전한 해 없음'}"
+         if gov_enabled else "- 정부 특일정보: **키 없음** — 구글 캘린더만 사용 중(README '정부 API 켜기')"),
+        f"- 구글 캘린더(보충): {len(found)}개 ({years[0] if years else '-'}~{years[-1] if years else '-'})",
         "",
     ]
+    if gov_errors:
+        lines += ["정부 응답 메모:", ""] + [f"- {e}" for e in gov_errors] + [""]
+    lines += ["## 출처와 다른 점", ""]
     if plan["only_local"]:
-        lines += ["**dates 에 있지만 출처는 모르는 날짜** — 사람이 넣은 것. 출처가 미래 대체공휴일·선거일을 빠뜨리므로 지우지 않는다.", ""]
+        lines += ["**dates 에 있지만 어느 출처도 모르는 날짜** — 사람이 넣은 것. 정부가 아는 해라면 곧 자동 취소되고, 모르는 해라면 그대로 둔다.", ""]
         lines += [f"- {d}" for d in plan["only_local"]]
+        lines.append("")
+    pending = sorted(d for d, v in seen.items() if v.get("gov_absent_since") and not v.get("retracted"))
+    if pending:
+        lines += [f"**정부 응답에 없어 취소 대기 중**({GOV_RETRACT_AFTER_DAYS}일 연속 없으면 취소)", ""]
+        lines += [f"- {d} (없어진 날 {seen[d]['gov_absent_since']})" for d in pending]
         lines.append("")
     auto = sorted(d for d, v in seen.items() if v.get("retracted"))
     if auto:
@@ -224,30 +353,36 @@ def render_status(doc: dict, found: dict, seen: dict, plan: dict, today: str) ->
         lines += [f"- {d} ({seen[d].get('name', '')}, {seen[d]['retracted']})" for d in auto]
         lines.append("")
     if plan["anomaly"]:
-        lines += ["**⚠ 사람 확인 필요** — 출처에서 한꺼번에 사라진 날짜(장애·형식 변경 가능성). 손대지 않았다.", ""]
-        lines += [f"- {d} ({seen[d].get('name', '')}, 마지막 확인 {seen[d]['last']})" for d in plan["anomaly"]]
+        lines += ["**⚠ 사람 확인 필요** — 한꺼번에 사라진 날짜(장애·형식 변경 가능성). 손대지 않았다.", ""]
+        lines += [f"- {d} ({seen[d].get('name', '')})" for d in plan["anomaly"]]
         lines.append("")
-    if not (plan["only_local"] or auto or plan["anomaly"]):
+    if not (plan["only_local"] or pending or auto or plan["anomaly"]):
         lines += ["없음 — 출처와 일치.", ""]
     return "\n".join(lines)
 
 
-def render_report(plan: dict, seen: dict) -> str:
+def render_report(plan: dict, seen: dict, gov_errors=()) -> str:
     """사람이 봐야 할 일이 있을 때만 내용을 돌려준다(없으면 빈 문자열)."""
     parts = []
     if plan["anomaly"]:
         parts.append("## 출처에서 한꺼번에 사라진 날짜 — 손대지 않았습니다\n")
-        parts.append("구글 캘린더 장애나 형식 변경일 수 있습니다. 진짜 폐지라면 holidays.json 의 removed 에 손으로 넣어 주세요.\n")
-        parts += [f"- {d} ({seen[d].get('name', '')}, 마지막 확인 {seen[d]['last']})" for d in plan["anomaly"]]
+        parts.append("출처 장애나 형식 변경일 수 있습니다. 진짜 폐지라면 holidays.json 의 removed 에 손으로 넣어 주세요.\n")
+        parts += [f"- {d} ({seen.get(d, {}).get('name', '')})" for d in plan["anomaly"]]
         parts.append("")
     if plan["retract"]:
         parts.append("## 출처가 거둬들여 자동으로 removed 에 넣었습니다\n")
-        parts += [f"- {d} ({seen[d].get('name', '')})" for d in plan["retract"]]
+        parts += [f"- {d} ({seen.get(d, {}).get('name', '')})" for d in plan["retract"]]
         parts.append("\n앱은 다음 확인 때(최대 7일) 이 날을 평일로 되돌립니다. 잘못이면 removed 에서 빼고 version 을 +1 하세요.")
         parts.append("")
     if plan["restore"]:
         parts.append("## 출처에 다시 나타나 되살렸습니다\n")
-        parts += [f"- {d} ({seen[d].get('name', '')})" for d in plan["restore"]]
+        parts += [f"- {d} ({seen.get(d, {}).get('name', '')})" for d in plan["restore"]]
+        parts.append("")
+    key_errors = [e for e in gov_errors if "SERVICE_KEY" in e or "등록되지 않은" in e or "LIMITED" in e]
+    if key_errors:
+        parts.append("## 정부 특일정보 API 키 문제\n")
+        parts += [f"- {e}" for e in key_errors]
+        parts.append("\n공공데이터포털에서 키 상태를 확인하고 GitHub secret `DATA_GO_KR_KEY` 를 갱신해 주세요. 그동안은 구글 캘린더만 씁니다.")
         parts.append("")
     return "\n".join(parts)
 
@@ -269,6 +404,7 @@ def dump_json(path: str, obj) -> None:
 def main() -> int:
     dry = "--dry-run" in sys.argv
     today = os.environ.get("TODAY") or date.today().isoformat()
+    this_year = int(today[:4])
 
     doc = load_json("holidays.json", None)
     if doc is None:
@@ -279,27 +415,40 @@ def main() -> int:
     try:
         found = parse_ics(fetch_ics())
     except Exception as e:  # 출처가 죽어도 파일은 건드리지 않는다
-        print(f"출처를 읽지 못했습니다 — {e}")
+        print(f"구글 캘린더를 읽지 못했습니다 — {e}")
         return 1
     if not found:
-        print("출처에서 공휴일을 하나도 못 찾았습니다 — 형식이 바뀌었을 수 있어 중단합니다")
+        print("구글 캘린더에서 공휴일을 하나도 못 찾았습니다 — 형식이 바뀌었을 수 있어 중단합니다")
         return 1
 
-    seen = update_seen(seen_doc.get("dates", {}), found, today)
-    plan = plan_changes(set(doc.get("dates", [])), set(doc.get("removed", [])), found, seen, today)
+    key = os.environ.get(GOV_KEY_ENV, "").strip()
+    gov, gov_years, gov_errors = {}, set(), []
+    if key:
+        gov, gov_years, gov_errors = gov_holidays(key, [this_year, this_year + 1, this_year + 2])
+        print(f"정부 특일정보: {len(gov)}개, 온전한 해 {sorted(gov_years) or '없음'}"
+              + (f", 메모 {gov_errors}" if gov_errors else ""))
+    else:
+        print("정부 특일정보 키 없음(DATA_GO_KR_KEY) — 구글 캘린더만 사용")
 
+    seen = update_seen(seen_doc.get("dates", {}), found, today, "google")
+    seen = update_seen(seen, gov, today, "gov")
+    plan = plan_changes(set(doc.get("dates", [])), set(doc.get("removed", [])),
+                        found, seen, today, gov, gov_years)
+
+    names = {**found, **gov}
     for d in plan["add"]:
-        print(f"  + {d}  {found[d]}")
+        print(f"  + {d}  {names.get(d, '')}  ({'정부' if int(d[:4]) in gov_years else '구글'})")
     for d in plan["retract"]:
-        print(f"  - {d}  {seen[d].get('name', '')}  (출처에서 {_days_between(seen[d]['last'], today)}일째 사라짐 → removed)")
+        why = "정부 응답에 연속 없음" if int(d[:4]) in gov_years else "구글이 거둬들임"
+        print(f"  - {d}  {seen.get(d, {}).get('name', '')}  ({why} → removed)")
     for d in plan["restore"]:
-        print(f"  ~ {d}  {found[d]}  (출처에 다시 나타남 → 되살림)")
+        print(f"  ~ {d}  {names.get(d, '')}  (출처에 다시 나타남 → 되살림)")
     for d in plan["anomaly"]:
-        print(f"  ! {d}  {seen[d].get('name', '')}  (한꺼번에 사라져 손대지 않음)")
+        print(f"  ! {d}  {seen.get(d, {}).get('name', '')}  (한꺼번에 사라져 손대지 않음)")
 
     changed = apply_plan(doc, plan, seen, today)
     if not changed:
-        print(f"변경 없음 (현재 {len(doc['dates'])}일, 출처 {len(found)}일)")
+        print(f"변경 없음 (현재 {len(doc['dates'])}일, 구글 {len(found)}일, 정부 {len(gov)}일)")
     else:
         print(f"version {doc['version']} 로 올리고 {len(doc['dates'])}일 저장")
 
@@ -311,15 +460,18 @@ def main() -> int:
         dump_json("holidays.json", doc)
 
     # 스냅샷·STATUS 는 내용이 바뀌었거나 주기가 지났을 때만 쓴다(매일 커밋하지 않으려고).
-    new_dates = {d for d in found if d not in seen_doc.get("dates", {})}
+    # 취소 대기(gov_absent_since)가 새로 생긴 날은 유예 계산을 위해 바로 쓴다.
+    prev = seen_doc.get("dates", {})
+    new_dates = {d for d in list(found) + list(gov) if d not in prev}
+    new_pending = {d for d, v in seen.items() if v.get("gov_absent_since") and not prev.get(d, {}).get("gov_absent_since")}
     written = seen_doc.get("written") or ""
     stale = (not written) or _days_between(written, today) >= SNAPSHOT_REFRESH_DAYS
-    if changed or new_dates or plan["anomaly"] or stale:
+    if changed or new_dates or new_pending or plan["anomaly"] or stale:
         dump_json(SEEN_PATH, {"written": today, "dates": dict(sorted(seen.items()))})
         with io.open(STATUS_PATH, "w", encoding="utf-8", newline="\n") as f:
-            f.write(render_status(doc, found, seen, plan, today))
+            f.write(render_status(doc, found, seen, plan, today, gov_years, gov_errors, bool(key)))
 
-    report = render_report(plan, seen)
+    report = render_report(plan, seen, gov_errors)
     if report:
         with io.open(REPORT_PATH, "w", encoding="utf-8", newline="\n") as f:
             f.write(report)

@@ -173,3 +173,120 @@ class Report(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GOV_JSON = """{"response":{"header":{"resultCode":"00","resultMsg":"NORMAL SERVICE."},
+"body":{"items":{"item":[
+ {"dateKind":"01","dateName":"1월1일","isHoliday":"Y","locdate":20270101,"seq":1},
+ {"dateKind":"01","dateName":"설날","isHoliday":"Y","locdate":20270206,"seq":1},
+ {"dateKind":"01","dateName":"근로자의날","isHoliday":"N","locdate":20270501,"seq":1},
+ {"dateKind":"01","dateName":"임시공휴일","isHoliday":"Y","locdate":20271015,"seq":1}
+]},"numOfRows":100,"pageNo":1,"totalCount":4}}}"""
+
+
+class ParseGov(unittest.TestCase):
+    def test_holiday_items_only(self):
+        self.assertEqual(u.parse_gov(GOV_JSON),
+                         {"2027-01-01": "1월1일", "2027-02-06": "설날", "2027-10-15": "임시공휴일"})
+
+    def test_single_item_is_object(self):
+        raw = '{"response":{"header":{"resultCode":"00"},"body":{"items":{"item":{"dateName":"x","isHoliday":"Y","locdate":20270101}}}}}'
+        self.assertEqual(u.parse_gov(raw), {"2027-01-01": "x"})
+
+    def test_empty_items(self):
+        raw = '{"response":{"header":{"resultCode":"00"},"body":{"items":"","totalCount":0}}}'
+        self.assertEqual(u.parse_gov(raw), {})
+
+    def test_key_error_raises(self):
+        raw = '{"OpenAPI_ServiceResponse":{"cmmMsgHeader":{"errMsg":"SERVICE_KEY_IS_NOT_REGISTERED_ERROR","returnAuthMsg":"등록되지 않은 서비스키","returnReasonCode":"30"}}}'
+        with self.assertRaises(ValueError):
+            u.parse_gov(raw)
+
+    def test_xml_error_raises(self):
+        with self.assertRaises(ValueError):
+            u.parse_gov("<OpenAPI_ServiceResponse><cmmMsgHeader><returnAuthMsg>LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_ERROR</returnAuthMsg></cmmMsgHeader></OpenAPI_ServiceResponse>")
+
+
+class GovHolidays(unittest.TestCase):
+    def test_partial_year_not_covered(self):
+        def fetch(key, year):
+            if year == 2026:
+                items = ",".join('{"dateName":"h%d","isHoliday":"Y","locdate":2026%02d01}' % (i, i) for i in range(1, 13))
+                return '{"response":{"header":{"resultCode":"00"},"body":{"items":{"item":[%s]}}}}' % items
+            if year == 2027:
+                return '{"response":{"header":{"resultCode":"00"},"body":{"items":{"item":[{"dateName":"x","isHoliday":"Y","locdate":20270101}]}}}}'
+            raise OSError("timeout")
+        found, covered, errors = u.gov_holidays("k", [2026, 2027, 2028], fetch=fetch)
+        self.assertEqual(covered, {2026})
+        self.assertEqual(len(found), 12)
+        self.assertEqual(len(errors), 2)
+
+
+class PlanWithGov(unittest.TestCase):
+    """정부가 아는 해(2027)는 정부가 정답, 모르는 해(2030)는 구글 규칙."""
+
+    def setUp(self):
+        self.gov = {"2027-02-06": "설날", "2027-02-07": "설날", "2027-02-08": "설날",
+                    "2027-01-01": "1월1일", "2027-10-15": "임시공휴일"}
+        self.gov_years = {2027}
+        self.google = {"2027-02-07": "설날", "2027-02-08": "설날 연휴", "2027-09-09": "구글만 아는 날",
+                       "2030-05-09": "부처님오신날"}
+
+    def plan(self, dates, removed, seen):
+        return u.plan_changes(set(dates), set(removed), self.google, seen, TODAY, self.gov, self.gov_years)
+
+    def test_gov_adds_immediately_and_google_ignored_in_gov_year(self):
+        seen = u.update_seen(u.update_seen({}, self.google, TODAY), self.gov, TODAY, "gov")
+        p = self.plan(["2027-02-07", "2027-02-08"], [], seen)
+        self.assertIn("2027-10-15", p["add"])       # 정부가 아는 임시공휴일 → 즉시
+        self.assertIn("2027-02-06", p["add"])
+        self.assertNotIn("2027-09-09", p["add"])    # 정부가 아는 해엔 구글 추가 무시
+        self.assertIn("2030-05-09", p["add"])       # 정부가 모르는 해는 구글로
+        self.assertNotIn("2027-01-01", p["add"])    # 고정 양력은 앱이 계산
+
+    def test_gov_absence_retracts_after_three_days(self):
+        # 사람이 넣은 2027-11-11 이 정부 응답에 없다 — 첫날은 대기, 3일째 취소
+        seen = u.update_seen(u.update_seen({}, self.google, TODAY), self.gov, TODAY, "gov")
+        p1 = self.plan(["2027-11-11"], [], seen)
+        self.assertEqual(p1["retract"], [])
+        self.assertEqual(seen["2027-11-11"]["gov_absent_since"], TODAY)
+        seen["2027-11-11"]["gov_absent_since"] = "2026-09-07"
+        p2 = self.plan(["2027-11-11"], [], seen)
+        self.assertEqual(p2["retract"], ["2027-11-11"])
+
+    def test_gov_presence_clears_absence(self):
+        seen = u.update_seen(u.update_seen({}, self.google, TODAY), self.gov, TODAY, "gov")
+        seen["2027-02-06"] = {"name": "설날", "gov_absent_since": "2026-09-01"}
+        p = self.plan(["2027-02-06"], [], seen)
+        self.assertEqual(p["retract"], [])
+        self.assertNotIn("gov_absent_since", seen["2027-02-06"])
+
+    def test_fixed_missing_from_gov_is_retracted_via_removed(self):
+        # 정부 응답에 2027-10-09(한글날)가 없으면 앱 계산을 removed 로 끈다(유예 뒤)
+        seen = u.update_seen({}, self.gov, TODAY, "gov")
+        seen["2027-10-09"] = {"gov_absent_since": "2026-09-01"}
+        p = self.plan([], [], seen)
+        self.assertIn("2027-10-09", p["anomaly"] + p["retract"])
+
+    def test_past_dates_not_retracted_by_gov(self):
+        seen = u.update_seen({}, self.gov, TODAY, "gov")
+        seen["2027-01-02"] = {"gov_absent_since": "2026-09-01"}
+        p = u.plan_changes({"2026-05-01"}, set(), self.google, seen, "2027-06-01", self.gov, self.gov_years)
+        self.assertNotIn("2026-05-01", p["retract"])
+
+    def test_google_rules_untouched_for_other_years(self):
+        seen = {"2030-05-06": {"name": "대체", "first": "2026-01-01", "last": "2026-09-01"}}
+        seen = u.update_seen(u.update_seen(seen, self.google, TODAY), self.gov, TODAY, "gov")
+        p = self.plan(["2030-05-06"], [], seen)
+        self.assertEqual(p["retract"], ["2030-05-06"])  # 구글이 알다가 9일째 거둬들임
+
+
+class ReportGov(unittest.TestCase):
+    def test_key_error_reported(self):
+        plan = {"add": [], "retract": [], "restore": [], "anomaly": [], "only_local": []}
+        r = u.render_report(plan, {}, ["2026: SERVICE_KEY_IS_NOT_REGISTERED_ERROR / 등록되지 않은 서비스키"])
+        self.assertIn("DATA_GO_KR_KEY", r)
+
+    def test_partial_year_note_not_reported(self):
+        plan = {"add": [], "retract": [], "restore": [], "anomaly": [], "only_local": []}
+        self.assertEqual(u.render_report(plan, {}, ["2028: 3개뿐이라 아직 없는 해로 봄"]), "")

@@ -3,7 +3,7 @@ name: auto-update
 # 공휴일을 자동으로 주워 온다.
 #
 # 임시공휴일·선거일은 보통 2주 전에는 발표되므로 하루 1회면 넉넉하다.
-# 출처(구글 캘린더 '대한민국의 휴일' ICS)는 API 키가 필요 없다.
+# 출처 = 정부 특일정보 API(정답, secret DATA_GO_KR_KEY 필요) + 구글 캘린더 ICS(먼 미래 보충, 키 불필요).
 # 추가는 자동. 삭제는 "출처가 알던 날을 7일 이상 거둬들였을 때"만 자동(update_holidays.py 참조) —
 # 출처가 미래 연도의 대체공휴일·선거일을 아예 모르는 경우가 있어, 단순히 "출처에 없으면 삭제"로
 # 가면 멀쩡한 휴일이 사라진다. 사람이 봐야 할 일이 생기면 이슈를 연다.
@@ -24,6 +24,9 @@ jobs:
 
       - name: 공휴일 수집·병합
         id: run
+        env:
+          # 공공데이터포털 '한국천문연구원_특일 정보' 디코딩 키. 없으면 구글 캘린더만 쓴다(README '정부 API 켜기').
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
         run: |
           python3 update_holidays.py | tee /tmp/out.txt
           # holidays.json(앱이 읽는 것)과 스냅샷·상태(사람이 보는 것)를 따로 판단한다.
