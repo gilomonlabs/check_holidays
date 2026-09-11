@@ -123,17 +123,18 @@ https://raw.githubusercontent.com/gilomonlabs/check_holidays/main/holidays.json
 |---|---|
 | `lib/services/holiday_update_service.dart` | 이 URL을 `manifestUrl` 상수로 들고 GET·파싱 |
 | `lib/providers/holidays.dart` | 3일 throttle, ETag 조건부 확인(같으면 304·0바이트), 버전 비교, **자동 적용**, 영속 |
+| `lib/features/common/holiday_refresh_manager.dart` | **앱 진입·복귀 때 확인을 시작**(달력이 없는 스킨에서도) |
 | `lib/data/holiday_store.dart` | 받은 날짜를 앱 문서함 `holiday_data.json`에 캐시 |
 | `lib/data/korean_holidays.dart` | `(고정 양력 ∪ 내장 ∪ dates) − removed` 로 휴일 판정 |
-| `lib/features/transactions/widgets/calendar_grid.dart` | **갱신을 시작**하고, 달력 셀을 빨갛게 |
+| `lib/features/transactions/widgets/calendar_grid.dart` | 달력이 열릴 때도 갱신을 시작(같은 throttle), 달력 셀을 빨갛게 |
 
 ---
 
 ## 어떻게 동작하나
 
 ```
-사용자가 달력을 연다
-  └─ 달력은 기존 데이터로 **즉시** 그려진다 (기다리지 않는다)
+사용자가 앱을 켠다(또는 백그라운드에서 돌아온다·달력을 연다)
+  └─ 화면은 기존 데이터로 **즉시** 그려진다 (기다리지 않는다)
       └─ 뒤에서: 마지막 확인으로부터 3일 지났나?
            ├─ 아니오 → 아무것도 안 함 (접속 0회)
            └─ 예 → 이 URL에 조건부 GET(If-None-Match, 타임아웃 8초) — 같으면 304, 0바이트
@@ -146,7 +147,7 @@ https://raw.githubusercontent.com/gilomonlabs/check_holidays/main/holidays.json
 
 핵심 세 가지:
 
-- **달력을 열 때만 확인합니다.** 공휴일이 쓰이는 곳이 달력뿐이라, 앱을 켤 때마다 볼 이유가 없습니다. 달력을 안 여는 사용자는 접속 0회입니다.
+- **앱에 들어올 때 확인합니다**(3일에 한 번, 같으면 0바이트). 예전엔 달력을 열 때만 확인했는데 달력이 없는 스킨에선 한 번도 안 돌아 2026-09-11에 옮겼습니다.
 - **자동으로 적용됩니다.** 공휴일은 개인 데이터가 아니라 공개된 사실이라 물어보지 않습니다. 예전엔 설정에 빨강 점만 찍어서, 그 점을 못 본 사용자의 달력은 계속 틀린 채로 남았습니다.
 - **화면을 막지 않습니다.** 달력은 기존 데이터로 즉시 그려지고, 새 날짜가 도착하면 그때 다시 그려집니다. 인터넷이 없으면 아무 일도 안 일어납니다.
 
@@ -184,7 +185,7 @@ https://raw.githubusercontent.com/gilomonlabs/check_holidays/main/holidays.json
 3. `updated`를 오늘 날짜로 (선택)
 4. 커밋 & push
 
-끝입니다. 사용자가 다음에 달력을 열 때(마지막 확인으로부터 3일이 지났으면) 저절로 반영됩니다.
+끝입니다. 사용자가 다음에 앱을 켤 때(마지막 확인으로부터 3일이 지났으면) 저절로 반영됩니다.
 
 ### 지우려면 — `removed` 에 넣으세요
 
@@ -225,14 +226,14 @@ https://raw.githubusercontent.com/gilomonlabs/check_holidays/main/holidays.json
 - **형식이 깨지면 조용히 무시됩니다.** JSON 파싱 실패·`version`이 정수가 아님·`dates`가 배열이 아님 → 앱은 그냥 못 본 척합니다. 오류 화면이 없으니 push 전에 확인하세요 (CI가 자동으로 검사합니다).
 - **`YYYY-MM-DD`가 아닌 문자열은 조용히 버려집니다.** `2026-8-17`(0 없음)은 통째로 무시됩니다.
 - **`removed` 와 `dates` 에 같은 날짜를 넣으면** 뜻이 모순이라 CI가 막습니다.
-- **반영에 최대 3일이 걸립니다.** push 즉시가 아닙니다 — 사용자가 달력을 열어야 하고, 마지막 확인으로부터 3일이 지나야 합니다. 급하면 앱 설정의 [지금 확인]이 throttle을 무시합니다.
+- **반영에 최대 3일이 걸립니다.** push 즉시가 아닙니다 — 사용자가 앱을 켜야 하고, 마지막 확인으로부터 3일이 지나야 합니다. 급하면 앱 설정의 [지금 확인]이 throttle을 무시합니다.
 
 ---
 
 ## 개인정보
 
 앱이 이 URL에 보내는 것은 **평범한 GET 요청 하나(약 1KB 응답)** 뿐이고,
-그것도 **달력을 열 때 3일에 한 번**이고, 바뀐 게 없으면 서버가 본문 없이(0바이트) 답합니다(ETag). 거래 내역·계정·기기 식별자 등
+그것도 **앱을 켤 때 3일에 한 번**이고, 바뀐 게 없으면 서버가 본문 없이(0바이트) 답합니다(ETag). 거래 내역·계정·기기 식별자 등
 어떤 개인정보도 전송하지 않습니다. 읽기 전용이고, 인증도 쿠키도 없습니다.
 
 ---
